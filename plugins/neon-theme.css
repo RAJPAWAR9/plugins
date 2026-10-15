@@ -1,0 +1,6 @@
+/* Neon Theme — a theme is just CSS. Override the app's variables. */
+:root{
+  --accent-r: 255; --accent-g: 46; --accent-b: 151;
+  --bg-0:#07040f; --bg-1:#0c0716; --bg-2:#120b20;
+}
+.nav-item.active{box-shadow: inset 3px 0 0 #00e5ff;}
