@@ -92,7 +92,7 @@ BOS.register({
             id: vid, _vid: vid,
             name: it.title || "Untitled",
             artistName: String(it.uploaderName || "YouTube").replace(/\s*-\s*Topic$/i, ""),
-            image: it.thumbnail || "",
+            image: "https://i.ytimg.com/vi/" + vid + "/mqdefault.jpg",
             duration: it.duration > 0 ? it.duration : 0
           });
         });
