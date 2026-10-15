@@ -1,13 +1,15 @@
-/* YouTube Music source plugin (audio only) - v1.1.0
+/* YouTube Music source plugin (audio only) - v1.2.0
    ON  = songs from YouTube Music appear in Search and can be played.   OFF = they disappear.
    Uses Piped API servers (public YouTube front-end). Servers go up and down, so this plugin:
      - loads a live list of Piped servers,
      - for playback, TESTS each server's audio link (CORS + range request) before giving it to the player,
        because the app's <audio> tag uses crossorigin="anonymous" and silently stays mute if the link has no CORS headers,
      - remembers the server that really worked.
+   If NO Piped server works (public ones are mostly dead now), it plays the same song from JioSaavn instead (best match by title,
+   artist and length) so the track still plays.
    Own server: Plugins -> YouTube Music -> Settings. */
 BOS.register({
-  id: "ytmusic", name: "YouTube Music", version: "1.1.0",
+  id: "ytmusic", name: "YouTube Music", version: "1.2.0",
   description: "Songs from YouTube Music, played as audio.",
 
   configure: function (api) {
@@ -103,6 +105,48 @@ BOS.register({
       finally { c.done(); }
     }
 
+
+    /* ---- fallback: same song from JioSaavn ---- */
+    function norm(s) {
+      return String(s || "").toLowerCase()
+        .replace(/\([^)]*\)|\[[^\]]*\]/g, " ")
+        .replace(/official|video|lyrical|lyrics|lyric|audio|full song|hd|4k|ft\.?|feat\.?|song|music/g, " ")
+        .replace(/[^a-z0-9\u0900-\u097f ]+/g, " ").replace(/\s+/g, " ").trim();
+    }
+    function toks(s) { return norm(s).split(" ").filter(function (w) { return w.length > 1; }); }
+    function overlap(a, b) {
+      if (!a.length || !b.length) return 0;
+      var hit = a.filter(function (w) { return b.indexOf(w) >= 0; }).length;
+      return hit / Math.max(1, Math.min(a.length, b.length));
+    }
+    function pickUrl(raw) {
+      var d = raw && raw.downloadUrl;
+      if (Array.isArray(d) && d.length) {
+        var best = d[d.length - 1];
+        for (var i = 0; i < d.length; i++) if (/160/.test(d[i].quality || "")) best = d[i];
+        return best && best.url;
+      }
+      return null;
+    }
+    async function jioFallback(track) {
+      var Api = api.unsafe && api.unsafe.Api;
+      if (!Api || !Api.searchSongs) throw new Error("JioSaavn fallback not available");
+      var nameT = toks(track.name), artT = toks(track.artistName);
+      var q = (norm(track.name) + " " + norm(track.artistName)).trim().slice(0, 80);
+      var r = await Api.searchSongs(q, 0, 10);
+      var res = (r && r.data && r.data.results) || [];
+      var bestScore = 0, best = null;
+      res.forEach(function (x) {
+        var s = overlap(nameT, toks(x.name || x.title)) * 0.6;
+        var xa = (x.artists && x.artists.primary || []).map(function (p) { return p.name; }).join(" ") + " " + (x.singers || x.primaryArtists || "");
+        s += overlap(artT, toks(xa)) * 0.25;
+        if (track.duration && x.duration && Math.abs(track.duration - Number(x.duration)) <= 15) s += 0.15;
+        if (s > bestScore && pickUrl(x)) { bestScore = s; best = x; }
+      });
+      if (!best || bestScore < 0.5) throw new Error("no matching song on JioSaavn");
+      return pickUrl(best);
+    }
+
     api.sources.register({
       name: "YouTube Music",
       ttl: 60 * 60 * 1000,   /* YouTube links expire: re-fetch after 60 min */
@@ -136,7 +180,9 @@ BOS.register({
 
       resolve: async function (track) {
         var vid = track._vid || String(track.id).split(":").pop();
-        var list = await bases(7), lastErr = null, t0 = Date.now(), tried = 0, noCors = 0;
+        var lastErr = null, t0 = Date.now(), tried = 0, noCors = 0;
+        var dead = api.storage.get("deadAt", 0);
+        var list = (Date.now() - dead < 10 * 60 * 1000) ? [] : await bases(6);   /* all Piped servers failed lately: go straight to fallback */
         for (var i = 0; i < list.length; i++) {
           if (Date.now() - t0 > 20000) break;          /* never make the user wait forever */
           try {
@@ -161,7 +207,14 @@ BOS.register({
             throw new Error("audio link blocked (no CORS)");
           } catch (e) { lastErr = e; }
         }
-        throw new Error("no working Piped server (" + (lastErr && lastErr.message || "unknown") + "). Try Plugins -> YouTube Music -> Settings and paste another Piped API URL.");
+        if (list.length) api.storage.set("deadAt", Date.now());
+        try {
+          var jurl = await jioFallback(track);
+          api.ui.toast("YouTube servers are down - playing the JioSaavn version of this song");
+          return { url: jurl };
+        } catch (e2) {
+          throw new Error("no working Piped server (" + (lastErr && lastErr.message || "skipped") + ") and " + (e2 && e2.message || "fallback failed") + ". Plugins -> YouTube Music -> Settings: paste a working Piped API URL.");
+        }
       }
     });
   }
