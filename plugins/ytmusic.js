@@ -5,8 +5,6 @@
      - for playback, TESTS each server's audio link (CORS + range request) before giving it to the player,
        because the app's <audio> tag uses crossorigin="anonymous" and silently stays mute if the link has no CORS headers,
      - remembers the server that really worked.
-   If NO Piped server works (public ones are mostly dead now), it plays the same song from JioSaavn instead (best match by title,
-   artist and length) so the track still plays.
    Own server: Plugins -> YouTube Music -> Settings. */
 BOS.register({
   id: "ytmusic", name: "YouTube Music", version: "1.2.0",
@@ -17,12 +15,13 @@ BOS.register({
     var v = prompt("Piped API server URL (example: https://pipedapi.kavin.rocks).\nLeave empty to use the automatic server list.", cur);
     if (v === null) return;
     v = v.trim().replace(/\/+$/, "");
+    if (v === cur) { api.ui.toast("Unchanged"); return; }
     api.storage.set("instance", v); api.storage.set("good", "");
     api.ui.toast(v ? "Server saved" : "Using the automatic server list");
   },
 
   init: function (api) {
-    var FILTER = "music_songs";
+    var FILTER = "music_songs", FILTER2 = "music_videos";
     var DEFAULTS = [
       "https://pipedapi.kavin.rocks",
       "https://pipedapi.adminforge.de",
@@ -33,35 +32,46 @@ BOS.register({
       "https://pipedapi.drgns.space"
     ];
     var LIST_URL = "https://piped-instances.kavin.rocks/";
-    var dyn = api.storage.get("dyn", null);      /* { t: time, list: [urls] } */
+    var DEADLINE = 20000;
+    var cache = {};   /* vid -> { url, alt, t } */
 
     function timed(ms, outer) {
       var ctl = new AbortController(), t = setTimeout(function () { ctl.abort(); }, ms);
+      function onOuter() { ctl.abort(); }
       if (outer) {
         if (outer.aborted) ctl.abort();
-        else outer.addEventListener("abort", function () { ctl.abort(); }, { once: true });
+        else outer.addEventListener("abort", onOuter, { once: true });
       }
-      return { signal: ctl.signal, done: function () { clearTimeout(t); } };
+      return {
+        signal: ctl.signal,
+        done: function () {
+          clearTimeout(t);
+          if (outer) outer.removeEventListener("abort", onOuter);
+        }
+      };
     }
 
     function fetchJson(url, ms, outer) {
       var c = timed(ms, outer);
       return fetch(url, { signal: c.signal }).then(function (r) {
-        c.done();
         if (!r.ok) throw new Error("HTTP " + r.status);
         return r.json();
-      }, function (e) { c.done(); throw e; });
+      }).then(function (j) { c.done(); return j; },
+              function (e) { c.done(); throw e; });
     }
 
     /* live list of Piped servers (cached 6 h); failure is fine, we still have DEFAULTS */
     async function loadDyn() {
+      var dyn = api.storage.get("dyn", null);
       if (dyn && dyn.list && dyn.list.length && Date.now() - dyn.t < 6 * 3600 * 1000) return dyn.list;
       try {
         var arr = await fetchJson(LIST_URL, 4000);
-        var l = (arr || []).filter(function (x) { return x && x.api_url && (x.uptime_30d == null || x.uptime_30d >= 60); })
-          .sort(function (a, b) { return (b.uptime_30d || 0) - (a.uptime_30d || 0); })
-          .map(function (x) { return String(x.api_url).replace(/\/+$/, ""); });
-        if (l.length) { dyn = { t: Date.now(), list: l.slice(0, 12) }; api.storage.set("dyn", dyn); return dyn.list; }
+        var l = (arr || []).filter(function (x) {
+          return x && x.api_url && (x.uptime_30d == null || x.uptime_30d >= 60);
+        }).sort(function (a, b) { return (b.uptime_30d || 0) - (a.uptime_30d || 0); })
+          .map(function (x) { return String(x.api_url).replace(/\/+$/, ""); })
+          .slice(0, 12);
+        if (l.length) { api.storage.set("dyn", { t: Date.now(), list: l }); return l; }
       } catch (e) {}
       return (dyn && dyn.list) || [];
     }
@@ -69,9 +79,12 @@ BOS.register({
     async function bases(max) {
       var extra = await loadDyn();
       var out = [], seen = {};
-      [api.storage.get("instance", ""), api.storage.get("good", "")].concat(DEFAULTS, extra).forEach(function (b) {
-        if (b && !seen[b]) { seen[b] = 1; out.push(b); }
-      });
+      [api.storage.get("instance", ""), api.storage.get("good", "")]
+        .concat(DEFAULTS, extra)
+        .forEach(function (b) {
+          b = b && b.replace(/\/+$/, "");
+          if (b && !seen[b]) { seen[b] = 1; out.push(b); }
+        });
       return out.slice(0, max);
     }
 
@@ -85,66 +98,57 @@ BOS.register({
       try {
         if (!proxyUrl) return url;
         var u = new URL(url);
-        if (!/googlevideo\.com$/.test(u.hostname)) return url;
+        if (!/(^|\.)googlevideo\.com$/.test(u.hostname)) return url;
         var pr = new URL(proxyUrl);
         u.searchParams.set("host", u.host);
-        u.protocol = pr.protocol; u.host = pr.host;
+        var base = pr.pathname.replace(/\/+$/, "");
+        u.protocol = pr.protocol;
+        u.host = pr.host;
+        u.pathname = base + u.pathname;
         return u.toString();
       } catch (e) { return url; }
     }
 
     /* can the <audio crossorigin="anonymous"> tag really load this link? (CORS + range request) */
-    async function probe(url, outer) {
-      var c = timed(4500, outer);
+    async function probe(url, ms, outer) {
+      var c = timed(ms || 4500, outer);
       try {
         var r = await fetch(url, { headers: { Range: "bytes=0-1" }, signal: c.signal });
         var ok = r.status === 200 || r.status === 206;
+        if (ok) {
+          var acao = r.headers.get("access-control-allow-origin");
+          var self = (typeof location !== "undefined" && location.origin) || "null";
+          if (acao !== "*" && acao !== self) ok = false;
+        }
         try { if (r.body && r.body.cancel) r.body.cancel(); } catch (e) {}
         return ok;
       } catch (e) { return false; }
       finally { c.done(); }
     }
 
+    function cleanArtist(n) {
+      return String(n || "YouTube")
+        .replace(/\s*-\s*Topic$/i, "")
+        .replace(/\s*VEVO$/i, "")
+        .replace(/\s*-\s*Official(\s+(Audio|Video))?$/i, "")
+        .replace(/\s*\(Official\s+(Audio|Video)\)$/i, "")
+        .trim() || "YouTube";
+    }
 
-    /* ---- fallback: same song from JioSaavn ---- */
-    function norm(s) {
-      return String(s || "").toLowerCase()
-        .replace(/\([^)]*\)|\[[^\]]*\]/g, " ")
-        .replace(/official|video|lyrical|lyrics|lyric|audio|full song|hd|4k|ft\.?|feat\.?|song|music/g, " ")
-        .replace(/[^a-z0-9\u0900-\u097f ]+/g, " ").replace(/\s+/g, " ").trim();
-    }
-    function toks(s) { return norm(s).split(" ").filter(function (w) { return w.length > 1; }); }
-    function overlap(a, b) {
-      if (!a.length || !b.length) return 0;
-      var hit = a.filter(function (w) { return b.indexOf(w) >= 0; }).length;
-      return hit / Math.max(1, Math.min(a.length, b.length));
-    }
-    function pickUrl(raw) {
-      var d = raw && raw.downloadUrl;
-      if (Array.isArray(d) && d.length) {
-        var best = d[d.length - 1];
-        for (var i = 0; i < d.length; i++) if (/160/.test(d[i].quality || "")) best = d[i];
-        return best && best.url;
-      }
-      return null;
-    }
-    async function jioFallback(track) {
-      var Api = api.unsafe && api.unsafe.Api;
-      if (!Api || !Api.searchSongs) throw new Error("JioSaavn fallback not available");
-      var nameT = toks(track.name), artT = toks(track.artistName);
-      var q = (norm(track.name) + " " + norm(track.artistName)).trim().slice(0, 80);
-      var r = await Api.searchSongs(q, 0, 10);
-      var res = (r && r.data && r.data.results) || [];
-      var bestScore = 0, best = null;
-      res.forEach(function (x) {
-        var s = overlap(nameT, toks(x.name || x.title)) * 0.6;
-        var xa = (x.artists && x.artists.primary || []).map(function (p) { return p.name; }).join(" ") + " " + (x.singers || x.primaryArtists || "");
-        s += overlap(artT, toks(xa)) * 0.25;
-        if (track.duration && x.duration && Math.abs(track.duration - Number(x.duration)) <= 15) s += 0.15;
-        if (s > bestScore && pickUrl(x)) { bestScore = s; best = x; }
+    function pushItems(out, seen, items) {
+      (items || []).forEach(function (it) {
+        if (it.type && it.type !== "stream") return;
+        var vid = videoId(it);
+        if (!vid || seen[vid]) return;
+        seen[vid] = 1;
+        out.push({
+          id: "ytmusic:" + vid, _vid: vid,
+          name: it.title || "Untitled",
+          artistName: cleanArtist(it.uploaderName),
+          image: "https://i.ytimg.com/vi/" + vid + "/hqdefault.jpg",
+          duration: it.duration > 0 ? it.duration : 0
+        });
       });
-      if (!best || bestScore < 0.5) throw new Error("no matching song on JioSaavn");
-      return pickUrl(best);
     }
 
     api.sources.register({
@@ -152,7 +156,8 @@ BOS.register({
       ttl: 60 * 60 * 1000,   /* YouTube links expire: re-fetch after 60 min */
 
       search: async function (q, opts) {
-        var outer = opts && opts.signal, list = await bases(4), lastErr = null, j = null;
+        var outer = opts && opts.signal, limit = (opts && opts.limit) || 20;
+        var list = await bases(4), lastErr = null, j = null;
         for (var i = 0; i < list.length && !j; i++) {
           try {
             j = await fetchJson(list[i] + "/search?q=" + encodeURIComponent(q) + "&filter=" + FILTER, 3500, outer);
@@ -163,58 +168,71 @@ BOS.register({
           }
         }
         if (!j) throw lastErr || new Error("no Piped server reachable");
-        var out = [];
-        (j.items || []).forEach(function (it) {
-          if (it.type && it.type !== "stream") return;
-          var vid = videoId(it); if (!vid) return;
-          out.push({
-            id: vid, _vid: vid,
-            name: it.title || "Untitled",
-            artistName: String(it.uploaderName || "YouTube").replace(/\s*-\s*Topic$/i, ""),
-            image: "https://i.ytimg.com/vi/" + vid + "/mqdefault.jpg",
-            duration: it.duration > 0 ? it.duration : 0
-          });
-        });
-        return out.slice(0, (opts && opts.limit) || 20);
+
+        var out = [], seen = {};
+        pushItems(out, seen, j.items);
+
+        /* songs only -> top up with videos (covers, live takes) */
+        if (out.length < limit) {
+          var list2 = await bases(3), j2 = null;
+          for (var m = 0; m < list2.length && !j2; m++) {
+            try {
+              j2 = await fetchJson(list2[m] + "/search?q=" + encodeURIComponent(q) + "&filter=" + FILTER2, 3000, outer);
+              if (j2 && j2.error) { j2 = null; throw new Error("server error"); }
+            } catch (e) {
+              if (e && e.name === "AbortError" && outer && outer.aborted) throw e;
+            }
+          }
+          if (j2) pushItems(out, seen, j2.items);
+        }
+        return out.slice(0, limit);
       },
 
-      resolve: async function (track) {
+      resolve: async function (track, opts) {
+        var outer = opts && opts.signal;
         var vid = track._vid || String(track.id).split(":").pop();
-        var lastErr = null, t0 = Date.now(), tried = 0, noCors = 0;
-        var dead = api.storage.get("deadAt", 0);
-        var list = (Date.now() - dead < 10 * 60 * 1000) ? [] : await bases(6);   /* all Piped servers failed lately: go straight to fallback */
+
+        var hit = cache[vid];
+        if (hit && Date.now() - hit.t < 50 * 60 * 1000) return { url: hit.url, alt: hit.alt };
+
+        var list = await bases(7), lastErr = null, t0 = Date.now(), blocked = 0;
+
         for (var i = 0; i < list.length; i++) {
-          if (Date.now() - t0 > 20000) break;          /* never make the user wait forever */
+          var left = DEADLINE - (Date.now() - t0);
+          if (left <= 800) break;
           try {
-            var j = await fetchJson(list[i] + "/streams/" + encodeURIComponent(vid), 5000);
+            var j = await fetchJson(list[i] + "/streams/" + encodeURIComponent(vid), Math.min(5000, left), outer);
             if (j && j.error) throw new Error(String(j.error).slice(0, 60));
             var a = (j.audioStreams || []).filter(function (s) { return s && s.url; });
             if (!a.length) throw new Error("no audio stream");
-            var mp4 = a.filter(function (s) { return /audio\/mp4/i.test(s.mimeType || "") || /m4a/i.test(s.format || ""); });
+
+            var mp4 = a.filter(function (s) {
+              return /audio\/mp4/i.test(s.mimeType || "") || /m4a/i.test(s.format || "");
+            });
             var rest = a.filter(function (s) { return mp4.indexOf(s) < 0; });
             function byRate(x, y) { return (y.bitrate || 0) - (x.bitrate || 0); }
             mp4.sort(byRate); rest.sort(byRate);
+
             var pick = mp4.slice(0, 2).concat(rest.slice(0, 1));   /* m4a first (works on every phone), webm as backup */
             for (var k = 0; k < pick.length; k++) {
+              left = DEADLINE - (Date.now() - t0);
+              if (left <= 500) break;
               var u = viaProxy(pick[k].url, j.proxyUrl);
-              tried++;
-              if (await probe(u)) {
+              if (await probe(u, Math.min(4500, left), outer)) {
                 api.storage.set("good", list[i]);
+                cache[vid] = { url: u, alt: pick[k].url, t: Date.now() };
                 return { url: u, alt: pick[k].url };
               }
-              noCors++;
+              blocked++;
             }
             throw new Error("audio link blocked (no CORS)");
-          } catch (e) { lastErr = e; }
+          } catch (e) {
+            if (e && e.name === "AbortError" && outer && outer.aborted) throw e;
+            lastErr = e;
+          }
         }
-        if (list.length) api.storage.set("deadAt", Date.now());
-        try {
-          var jurl = await jioFallback(track);
-          api.ui.toast("YouTube servers are down - playing the JioSaavn version of this song");
-          return { url: jurl };
-        } catch (e2) {
-          throw new Error("no working Piped server (" + (lastErr && lastErr.message || "skipped") + ") and " + (e2 && e2.message || "fallback failed") + ". Plugins -> YouTube Music -> Settings: paste a working Piped API URL.");
-        }
+        var why = lastErr ? lastErr.message : (blocked ? "all links blocked" : "unknown");
+        throw new Error("no working Piped server (" + why + "). Try Plugins -> YouTube Music -> Settings and paste another Piped API URL.");
       }
     });
   }
